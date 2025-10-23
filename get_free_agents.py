@@ -22,17 +22,15 @@ def load_oauth():
     if os.path.exists(TOKEN_FILE):
         try:
             oauth = OAuth2(None, None, from_file=TOKEN_FILE)
+            if not oauth.token_is_valid():
+                oauth.refresh_access_token()
+            return oauth
         except Exception as e:
             print(f"Warning: bad token file '{TOKEN_FILE}': {e}. Removing and re-authing...", file=sys.stderr)
             try:
                 os.remove(TOKEN_FILE)
             except OSError:
                 pass
-            oauth = None
-        else:
-            if not oauth.token_is_valid():
-                oauth.refresh_access_token()
-            return oauth
 
     # First-time login
     if not APP_KEY or not APP_SECRET:
@@ -74,77 +72,85 @@ def format_nba_team(p):
     )
 
 
-def pick_my_team(gm: yfa.Game):
+def pick_my_league(gm: yfa.Game):
     """
-    Find the league/team owned by the current login.
-    Returns (league, team_key, team_name).
+    Find the first league for the current login.
+    Returns league object.
     """
     league_ids = gm.league_ids()
     if not league_ids:
         raise RuntimeError("No NBA leagues found on this Yahoo account.")
-
-    for lid in league_ids:
-        league = gm.to_league(lid)
-        teams = league.teams()  # {team_key: team_info_or_name}
-        for tkey, tinfo in teams.items():
-            if isinstance(tinfo, str):
-                # Some versions just return the name string
-                name = tinfo
-                tinfo = {"name": name}
-            # Ownership signals
-            is_owned = bool(tinfo.get("is_owned_by_current_login"))
-            if not is_owned:
-                # Check managers list for current login flag
-                managers = tinfo.get("managers", [])
-                try:
-                    mgr = managers[0].get("manager", {})
-                    is_owned = str(mgr.get("is_current_login", "0")) == "1"
-                except Exception:
-                    pass
-            if is_owned:
-                return league, tkey, tinfo.get("name", "My Team")
-
-    # Fallback if the API didn’t flag ownership
-    first_league = gm.to_league(league_ids[0])
-    first_team_key = next(iter(first_league.teams().keys()))
-    first_team_name = first_league.teams()[first_team_key]
-    if isinstance(first_team_name, dict):
-        first_team_name = first_team_name.get("name", str(first_team_key))
-    return first_league, first_team_key, first_team_name
+    
+    return gm.to_league(league_ids[0])
 
 
 def main():
     oauth = load_oauth()
     gm = yfa.Game(oauth, "nba")
 
-    league, my_team_key, my_team_name = pick_my_team(gm)
-    # league.league_id is a PROPERTY, not a function
-    print(f"Using league: {league.league_id}  |  Team: {my_team_name} ({my_team_key})")
+    league = pick_my_league(gm)
+    print(f"Fetching free agents from league: {league.league_id}")
 
-    my_team = league.to_team(my_team_key)
-    roster = my_team.roster()  # list[dict]
+    # Get free agents - you can specify position and count
+    # Available positions: PG, SG, G, SF, PF, F, C, Util
+    # Let's get top 100 available players across all positions
+    print("\nFetching free agents (this may take a moment)...")
+    
+    # Free agents API: league.free_agents(position)
+    # We'll fetch all positions - you can filter by specific position if needed
+    try:
+        free_agents = league.free_agents("ALL")
+    except:
+        # Fallback: try without position filter
+        try:
+            free_agents = league.free_agents()
+        except Exception as e:
+            print(f"Error fetching free agents: {e}")
+            print("Trying alternative method...")
+            # Some versions need position specified
+            free_agents = []
+            for pos in ["PG", "SG", "SF", "PF", "C"]:
+                try:
+                    agents = league.free_agents(pos)
+                    if agents:
+                        free_agents.extend(agents)
+                except:
+                    pass
 
-    print("\nYour current roster:")
+    if not free_agents:
+        print("No free agents found or unable to fetch.")
+        return
+
+    print(f"\nFound {len(free_agents)} free agents:")
     rows = []
-    for p in roster:
+    
+    for p in free_agents:
         name = p.get("name", "-")
         pos = format_position(p)
         nba_team = format_nba_team(p)
         status = p.get("status") or p.get("injury_note") or ""
-        print(f"- {name} ({pos}) — {nba_team} {('[' + status + ']') if status else ''}")
+        
+        # Try to get player stats/rank info if available
+        ownership = p.get("percent_owned", "")
+        if ownership:
+            ownership = f"{ownership}%"
+        
+        print(f"- {name} ({pos}) — {nba_team} {('[' + status + ']') if status else ''} {('Own: ' + ownership) if ownership else ''}")
+        
         rows.append(
             {
                 "name": name,
                 "position": pos,
                 "nba_team": nba_team,
                 "status": status,
+                "ownership": ownership,
             }
         )
 
-    # Save CSV for easy weekly use
-    out_path = "roster.csv"
+    # Save CSV
+    out_path = "free_agents.csv"
     with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "position", "nba_team", "status"])
+        writer = csv.DictWriter(f, fieldnames=["name", "position", "nba_team", "status", "ownership"])
         writer.writeheader()
         writer.writerows(rows)
     print(f"\nSaved: {out_path}")
